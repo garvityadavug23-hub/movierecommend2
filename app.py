@@ -23,6 +23,20 @@ ERA_YEAR_MAP = {
 }
 
 # ─────────────────────────────────────────────
+# SESSION STATE — initialise first,
+# migrate legacy list-based watchlist if needed
+# ─────────────────────────────────────────────
+if "watchlist" not in st.session_state:
+    st.session_state.watchlist = {}          # title -> score (0-100)
+elif isinstance(st.session_state.watchlist, list):
+    st.session_state.watchlist = {t: 50 for t in st.session_state.watchlist}
+
+if "selected_watch" not in st.session_state:
+    st.session_state.selected_watch = None
+if "recs" not in st.session_state:
+    st.session_state.recs = []
+
+# ─────────────────────────────────────────────
 # DATA LOADING
 # ─────────────────────────────────────────────
 @st.cache_data
@@ -56,54 +70,46 @@ movies_raw = load_data()
 vectors, similarity = build_vectors(movies_raw['tags'])
 
 # ─────────────────────────────────────────────
-# SESSION STATE
+# SCORE → WEIGHT MAPPING
+# 0-30   strong dislike  → large negative
+# 31-49  mild dislike    → small negative
+# 50     neutral         → ignored
+# 51-69  mild like       → small positive
+# 70-100 strong like     → large positive
 # ─────────────────────────────────────────────
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = {}          # title -> rating (1-5)
-if "selected_watch" not in st.session_state:
-    st.session_state.selected_watch = None
-if "recs" not in st.session_state:
-    st.session_state.recs = []
+def score_to_weight(score):
+    norm = (score - 50) / 50.0   # maps 0→-1.0, 50→0.0, 100→+1.0
+    # Amplify extreme scores
+    if abs(norm) >= 0.4:
+        return norm * 2.0
+    return norm
 
-# ─────────────────────────────────────────────
-# COLLABORATIVE FILTERING CORE
-# ─────────────────────────────────────────────
+
 def build_user_taste_vector():
-    """
-    Weighted average of content vectors for rated movies.
-    Rating >= 4  → strong positive signal (weight = rating)
-    Rating <= 2  → negative signal (subtracted)
-    Rating == 3  → neutral (ignored)
-    """
     if not st.session_state.watchlist:
-        return None
+        return None, None
 
-    pos_vecs, pos_weights = [], []
-    neg_vecs = []
+    pos_sum = np.zeros(vectors.shape[1])
+    neg_sum = np.zeros(vectors.shape[1])
+    pos_w = 0.0
+    neg_w = 0.0
 
-    for title, rating in st.session_state.watchlist.items():
+    for title, score in st.session_state.watchlist.items():
         idx_list = movies_raw[movies_raw['title'] == title].index
         if len(idx_list) == 0:
             continue
-        idx = idx_list[0]
-        vec = vectors[idx]
-        if rating >= 4:
-            pos_vecs.append(vec * rating)
-            pos_weights.append(rating)
-        elif rating <= 2:
-            neg_vecs.append(vec)
+        vec = vectors[idx_list[0]]
+        w = score_to_weight(score)
+        if w > 0:
+            pos_sum += vec * w
+            pos_w += w
+        elif w < 0:
+            neg_sum += vec * abs(w)
+            neg_w += abs(w)
 
-    if not pos_vecs:
-        return None
-
-    taste = np.sum(pos_vecs, axis=0) / sum(pos_weights)
-
-    # Subtract negative taste signal
-    if neg_vecs:
-        neg_avg = np.mean(neg_vecs, axis=0)
-        taste = taste - 0.5 * neg_avg
-
-    return taste
+    pos_vec = pos_sum / pos_w if pos_w > 0 else None
+    neg_vec = neg_sum / neg_w if neg_w > 0 else None
+    return pos_vec, neg_vec
 
 
 def recommend(base_movie, mood_filter, genre_filter, era_filter, text_filter):
@@ -111,69 +117,52 @@ def recommend(base_movie, mood_filter, genre_filter, era_filter, text_filter):
     if len(idx_list) == 0:
         return []
 
-    idx = idx_list[0]
-    base_distances = similarity[idx].copy()
-    user_taste = build_user_taste_vector()
-
+    base_distances = similarity[idx_list[0]].copy()
+    pos_vec, neg_vec = build_user_taste_vector()
     scored = []
 
     for i in range(len(movies_raw)):
         row = movies_raw.iloc[i]
-        score = base_distances[i]
+        s = base_distances[i]
 
-        # ── User taste (collaborative signal) ──────────────────────
-        if user_taste is not None:
-            taste_sim = cosine_similarity([user_taste], [vectors[i]])[0][0]
-            score += 0.6 * taste_sim           # heavier weight than before
+        if pos_vec is not None:
+            s += 0.7 * cosine_similarity([pos_vec], [vectors[i]])[0][0]
+        if neg_vec is not None:
+            s -= 0.5 * cosine_similarity([neg_vec], [vectors[i]])[0][0]
 
-        # ── Mood boost ──────────────────────────────────────────────
         if mood_filter != "Any":
-            mood_genres = MOOD_GENRE_MAP.get(mood_filter, [])
-            if any(g in row['genre_list'] for g in mood_genres):
-                score += 0.25
-
-        # ── Genre boost ─────────────────────────────────────────────
-        if genre_filter != "Any":
-            if genre_filter in row['genre_list']:
-                score += 0.25
-
-        # ── Era boost ───────────────────────────────────────────────
+            if any(g in row['genre_list'] for g in MOOD_GENRE_MAP.get(mood_filter, [])):
+                s += 0.25
+        if genre_filter != "Any" and genre_filter in row['genre_list']:
+            s += 0.25
         if era_filter != "Any":
             try:
                 year = int(str(row['release_date'])[:4])
-                start, end = ERA_YEAR_MAP[era_filter]
-                if start <= year <= end:
-                    score += 0.1
+                lo, hi = ERA_YEAR_MAP[era_filter]
+                if lo <= year <= hi:
+                    s += 0.1
             except:
                 pass
-
-        # ── Keyword match ───────────────────────────────────────────
         if text_filter.strip():
-            keywords = text_filter.lower().split()
-            overview = str(row['overview']).lower()
-            matches = sum(1 for kw in keywords if kw in overview)
-            score += 0.08 * matches
+            ov = str(row['overview']).lower()
+            s += 0.08 * sum(1 for kw in text_filter.lower().split() if kw in ov)
 
-        # ── Penalise already-rated movies ───────────────────────────
         if row['title'] in st.session_state.watchlist:
-            score -= 999
+            s = -9999
 
-        scored.append((i, score))
+        scored.append((i, s))
 
     scored.sort(key=lambda x: x[1], reverse=True)
-
     results = []
     for i, s in scored:
-        title = movies_raw.iloc[i]['title']
-        if title != base_movie:
+        if movies_raw.iloc[i]['title'] != base_movie:
             results.append((i, s))
         if len(results) >= 8:
             break
-
     return results
 
 # ─────────────────────────────────────────────
-# TMDB API HELPERS
+# HELPERS
 # ─────────────────────────────────────────────
 def get_poster(movie_id):
     try:
@@ -196,14 +185,22 @@ def get_trailer(movie_id):
         pass
     return None
 
+def score_label(score):
+    if score >= 85:   return "❤️ Masterpiece"
+    elif score >= 70: return "👍 Really liked it"
+    elif score >= 55: return "🙂 Pretty decent"
+    elif score == 50: return "😐 Neutral"
+    elif score >= 35: return "😕 Didn't enjoy it"
+    elif score >= 20: return "👎 Disliked it"
+    else:             return "🤮 Hated it"
+
 # ─────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────
 st.set_page_config(layout="wide", page_title="CineAI PRO")
 st.title("🎬 CineAI PRO")
-st.caption("Rate movies you've seen → get smarter recommendations over time")
+st.caption("Score movies 0–100. The engine learns your taste from every rating.")
 
-# ── Filters ─────────────────────────────────
 col1, col2 = st.columns(2)
 with col1:
     mood  = st.selectbox("🎭 Mood",  ["Any", "Happy", "Sad", "Thrilling", "Romantic"])
@@ -211,158 +208,134 @@ with col1:
                                        "Sci-Fi", "Romance", "Thriller", "Animation"])
 with col2:
     era  = st.selectbox("📅 Era", ["Any", "2000s", "2010s", "2020s"])
-    text = st.text_input("🔍 Describe what you want (keywords)")
+    text = st.text_input("🔍 Keywords (e.g. 'space war revenge')")
 
-selected_movie = st.selectbox("🎥 Base Movie (starting point)", movies_raw['title'].values)
+selected_movie = st.selectbox("🎥 Base Movie", movies_raw['title'].values)
 
-if st.button("✨ Get AI Recommendations", use_container_width=True):
-    with st.spinner("🧠 Analysing your taste..."):
+if st.button("✨ Get Recommendations", use_container_width=True):
+    with st.spinner("🧠 Building your taste profile and finding matches..."):
         st.session_state.recs = recommend(selected_movie, mood, genre, era, text)
 
-# ── Recommendation Results ───────────────────
+# ── Results ──────────────────────────────────
 if st.session_state.recs:
     rated_count = len(st.session_state.watchlist)
     if rated_count == 0:
-        st.info("💡 **Tip:** Rate movies in your watchlist to get personalised recommendations!")
+        st.info("💡 Rate movies below (0–100) to teach the engine your taste. "
+                "Even 3–4 ratings make a noticeable difference.")
     else:
-        st.success(f"🧠 Personalised using {rated_count} rated movie(s) from your watchlist")
+        loved    = [t for t, r in st.session_state.watchlist.items() if r >= 70]
+        disliked = [t for t, r in st.session_state.watchlist.items() if r <= 30]
+        parts = [f"🧠 Taste profile from **{rated_count}** rating(s)."]
+        if loved:    parts.append(f"Pulling toward: _{', '.join(loved[:3])}_.")
+        if disliked: parts.append(f"Filtering away: _{', '.join(disliked[:2])}_.")
+        st.success(" ".join(parts))
 
-    st.subheader("🤖 AI Picks For You")
+    st.subheader("🤖 Your Personalised Picks")
     cols = st.columns(4)
 
     for i, rec in enumerate(st.session_state.recs):
-        movie = movies_raw.iloc[rec[0]]
-        imdb  = round(movie['vote_average'], 1)
-        stars = "⭐" * int(imdb // 2)
+        movie   = movies_raw.iloc[rec[0]]
+        imdb    = round(movie['vote_average'], 1)
+        m_title = str(movie['title'])
 
         with cols[i % 4]:
             st.image(get_poster(movie['id']))
-
-            with st.expander(f"{movie['title']}  {stars} ({imdb}/10)"):
+            with st.expander(f"{m_title}  ⭐{imdb}/10"):
                 st.caption("Genres: " + ", ".join(movie['genre_list']))
-                st.caption("Year:   " + str(movie['release_date'])[:4])
-                st.write(movie['overview'][:200] + "...")
+                st.caption("Year: "   + str(movie['release_date'])[:4])
+                st.write(str(movie['overview'])[:200] + "...")
 
-                # AI reason
                 reasons = []
+                pv, _ = build_user_taste_vector()
+                if pv is not None:
+                    ts = cosine_similarity([pv], [vectors[rec[0]]])[0][0]
+                    if ts > 0.15:
+                        reasons.append("matches your taste profile")
                 if genre != "Any" and genre in movie['genre_list']:
-                    reasons.append(f"matches **{genre}** genre")
-                if mood != "Any":
-                    mg = MOOD_GENRE_MAP.get(mood, [])
-                    if any(g in movie['genre_list'] for g in mg):
-                        reasons.append(f"fits **{mood}** mood")
-                if build_user_taste_vector() is not None:
-                    reasons.append("aligned with your taste profile")
+                    reasons.append(f"{genre} genre match")
+                if mood != "Any" and any(g in movie['genre_list'] for g in MOOD_GENRE_MAP.get(mood, [])):
+                    reasons.append(f"{mood} mood fit")
                 if reasons:
-                    st.caption("🤖 Because: " + ", ".join(reasons))
+                    st.caption("🤖 Why: " + " · ".join(reasons))
 
-                # Trailer
                 trailer = get_trailer(movie['id'])
                 if trailer:
                     st.video(trailer)
                 else:
-                    st.caption("Trailer not available")
+                    st.caption("No trailer available")
 
-                # Add to watchlist with inline rating
-                if movie['title'] not in st.session_state.watchlist:
-                    rating = st.select_slider(
-                        "Your rating",
-                        options=[1, 2, 3, 4, 5],
-                        value=3,
-                        key=f"rate_{i}",
-                        help="1=Hated it  3=It's ok  5=Loved it"
-                    )
-                    if st.button("➕ Add to Watchlist", key=f"add_{i}"):
-                        st.session_state.watchlist[movie['title']] = rating
-                        st.success(f"Added '{movie['title']}' with {rating}⭐ rating!")
+                if m_title not in st.session_state.watchlist:
+                    rv = st.slider("Your score", 0, 100, 50, key=f"rate_{i}")
+                    st.caption(score_label(rv))
+                    if st.button("➕ Rate & Save", key=f"add_{i}"):
+                        st.session_state.watchlist[m_title] = int(rv)
+                        st.success(f"Saved {rv}/100 ✓")
                         st.rerun()
                 else:
-                    current = st.session_state.watchlist[movie['title']]
-                    st.caption(f"✅ In watchlist — rated {current}⭐")
+                    cur = st.session_state.watchlist[m_title]
+                    st.caption(f"✅ You rated: **{cur}/100** — {score_label(cur)}")
 
 # ─────────────────────────────────────────────
-# SIDEBAR — WATCHLIST
+# SIDEBAR — RATED MOVIES
 # ─────────────────────────────────────────────
-st.sidebar.title("📌 My Watchlist")
+st.sidebar.title("📌 My Ratings")
 
 if not st.session_state.watchlist:
-    st.sidebar.caption("Your watchlist is empty.\nAdd & rate movies to personalise recommendations.")
+    st.sidebar.caption("No ratings yet. Score movies to personalise results.")
 else:
-    st.sidebar.caption(f"{len(st.session_state.watchlist)} movie(s) rated")
+    vals = list(st.session_state.watchlist.values())
+    st.sidebar.metric("Movies Rated", len(vals))
+    st.sidebar.metric("Avg Score", f"{round(sum(vals)/len(vals), 1)}/100")
 
-    # Taste summary
-    ratings = list(st.session_state.watchlist.values())
-    avg_r   = round(sum(ratings) / len(ratings), 1)
-    st.sidebar.metric("Avg. Rating", f"{avg_r} ⭐")
-
-    liked    = [t for t, r in st.session_state.watchlist.items() if r >= 4]
-    disliked = [t for t, r in st.session_state.watchlist.items() if r <= 2]
-    if liked:
-        st.sidebar.success("❤️ Loved: " + ", ".join(liked[:3]))
-    if disliked:
-        st.sidebar.error("👎 Disliked: " + ", ".join(disliked[:3]))
+    loved    = [t for t, r in st.session_state.watchlist.items() if r >= 70]
+    disliked = [t for t, r in st.session_state.watchlist.items() if r <= 30]
+    if loved:    st.sidebar.success("❤️ " + "  |  ".join(loved[:3]))
+    if disliked: st.sidebar.error("👎 "   + "  |  ".join(disliked[:2]))
 
     st.sidebar.markdown("---")
-
     for i, (title, rating) in enumerate(list(st.session_state.watchlist.items())):
-        c1, c2, c3 = st.sidebar.columns([3, 1, 1])
-
-        if c1.button(title[:22] + ("…" if len(title) > 22 else ""), key=f"view_{i}"):
-            st.session_state.selected_watch = title
+        st.sidebar.markdown(f"**{title[:26]}{'…' if len(title)>26 else ''}**")
+        c1, c2 = st.sidebar.columns([5, 1])
+        new_r = c1.slider("", 0, 100, rating, key=f"rerate_{i}",
+                          label_visibility="collapsed")
+        c1.caption(score_label(new_r))
+        if new_r != rating:
+            st.session_state.watchlist[title] = int(new_r)
             st.rerun()
-
-        # Inline re-rating
-        new_rating = c2.selectbox(
-            "", [1, 2, 3, 4, 5],
-            index=rating - 1,
-            key=f"rerate_{i}",
-            label_visibility="collapsed"
-        )
-        if new_rating != rating:
-            st.session_state.watchlist[title] = new_rating
-            st.rerun()
-
-        if c3.button("❌", key=f"remove_{i}"):
+        if c2.button("❌", key=f"rm_{i}"):
             del st.session_state.watchlist[title]
             st.rerun()
+        if c1.button("📋 View Details", key=f"view_{i}"):
+            st.session_state.selected_watch = title
+            st.rerun()
+        st.sidebar.markdown("---")
 
 # ─────────────────────────────────────────────
-# SELECTED MOVIE DETAIL
+# MOVIE DETAIL PANEL
 # ─────────────────────────────────────────────
 if st.session_state.selected_watch:
     match = movies_raw[movies_raw['title'] == st.session_state.selected_watch]
-
     if not match.empty:
-        movie = match.iloc[0]
-
+        movie   = match.iloc[0]
+        m_title = str(movie['title'])
         st.markdown("---")
         st.markdown("## 🎬 Movie Detail")
-
         c1, c2 = st.columns([1, 2])
-
         with c1:
             st.image(get_poster(movie['id']))
-
         with c2:
-            st.subheader(movie['title'])
-            st.write(f"**IMDb Score:** {movie['vote_average']} / 10")
+            st.subheader(m_title)
+            st.write(f"**IMDb:** {movie['vote_average']} / 10")
             st.write(f"**Genres:** {', '.join(movie['genre_list'])}")
             st.write(f"**Year:** {str(movie['release_date'])[:4]}")
             st.write(movie['overview'])
-
-            # Rating widget in detail view
-            current_rating = st.session_state.watchlist.get(movie['title'], 3)
-            new_r = st.select_slider(
-                "Rate this movie",
-                options=[1, 2, 3, 4, 5],
-                value=current_rating,
-                key="detail_rating"
-            )
+            cur = st.session_state.watchlist.get(m_title, 50)
+            new_s = st.slider("Rate (0–100)", 0, 100, cur, key="detail_rating")
+            st.caption(score_label(new_s))
             if st.button("💾 Save Rating"):
-                st.session_state.watchlist[movie['title']] = new_r
-                st.success(f"Saved {new_r}⭐ for '{movie['title']}'")
+                st.session_state.watchlist[m_title] = int(new_s)
+                st.success(f"Saved {new_s}/100 for '{m_title}'")
                 st.rerun()
-
             trailer = get_trailer(movie['id'])
             if trailer:
                 st.video(trailer)
