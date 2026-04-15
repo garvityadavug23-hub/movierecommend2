@@ -5,8 +5,7 @@ import ast
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# ---------- CONFIG ----------
-TMDB_API_KEY = "YOUR_TMDB_KEY"
+TMDB_API_KEY = "63c39d2a4b6cbbe2c300411d8980ade1"
 IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 
 MOOD_GENRE_MAP = {
@@ -22,16 +21,13 @@ ERA_YEAR_MAP = {
     "2020s": (2020, 2030),
 }
 
-# ---------- LOAD DATA ----------
 @st.cache_data
 def load_data():
-    df = pd.read_csv("tmdb_5000_movies.csv")
-    return df
+    return pd.read_csv("tmdb_5000_movies.csv")
 
 movies_raw = load_data()
 movies_raw = movies_raw[['id', 'title', 'overview', 'genres', 'vote_average', 'release_date']].dropna()
 
-# ---------- PREPROCESS ----------
 def convert(obj):
     L = []
     try:
@@ -64,14 +60,14 @@ def build_user_profile(watchlist):
         return None
     return vectors[indices].mean(axis=0)
 
-def ai_recommend(movie, watchlist, mood_filter, genre_filter, era_filter, text_filter):
+def recommend(movie, mood_filter, genre_filter, era_filter, text_filter):
     idx_list = movies_raw[movies_raw['title'] == movie].index
     if len(idx_list) == 0:
         return []
 
     idx = idx_list[0]
     base_distances = similarity[idx]
-    user_vector = build_user_profile(watchlist)
+    user_vector = build_user_profile(st.session_state.watchlist)
 
     scored = []
 
@@ -79,23 +75,23 @@ def ai_recommend(movie, watchlist, mood_filter, genre_filter, era_filter, text_f
         row = movies_raw.iloc[i]
         score = base_distances[i]
 
-        # User taste boost
+        # 🧠 User profile boost (collaborative feel)
         if user_vector is not None:
             user_sim = cosine_similarity([user_vector], [vectors[i]])[0][0]
             score += 0.4 * user_sim
 
-        # Mood boost
+        # 🎭 Mood
         if mood_filter != "Any":
             mood_genres = MOOD_GENRE_MAP.get(mood_filter, [])
             if any(g in row['genre_list'] for g in mood_genres):
                 score += 0.2
 
-        # Genre boost
+        # 🎬 Genre
         if genre_filter != "Any":
             if genre_filter in row['genre_list']:
                 score += 0.2
 
-        # Era boost
+        # 📅 Era
         if era_filter != "Any":
             try:
                 year = int(str(row['release_date'])[:4])
@@ -105,7 +101,7 @@ def ai_recommend(movie, watchlist, mood_filter, genre_filter, era_filter, text_f
             except:
                 pass
 
-        # Text boost
+        # 🔍 Text
         if text_filter.strip():
             keywords = text_filter.lower().split()
             overview = str(row['overview']).lower()
@@ -119,7 +115,7 @@ def ai_recommend(movie, watchlist, mood_filter, genre_filter, era_filter, text_f
     results = []
     for i, s in scored:
         title = movies_raw.iloc[i]['title']
-        if title != movie and title not in watchlist:
+        if title != movie and title not in st.session_state.watchlist:
             results.append((i, s))
         if len(results) >= 8:
             break
@@ -167,14 +163,7 @@ selected_movie = st.selectbox("Base Movie", movies_raw['title'].values)
 # ---------- RECOMMEND ----------
 if st.button("🎥 Get AI Recommendations"):
     with st.spinner("🧠 AI is analyzing your taste..."):
-        recs = ai_recommend(
-            selected_movie,
-            st.session_state.watchlist,
-            mood,
-            genre,
-            era,
-            text
-        )
+        recs = recommend(selected_movie, mood, genre, era, text)
 
     if not recs:
         st.warning("No recommendations found.")
@@ -209,7 +198,7 @@ if st.button("🎥 Get AI Recommendations"):
                             reason.append("fits your mood")
 
                     if st.session_state.watchlist:
-                        reason.append("similar to your watchlist")
+                        reason.append("based on your watchlist")
 
                     if reason:
                         st.caption("🤖 AI says: " + ", ".join(reason))
@@ -223,13 +212,13 @@ if st.button("🎥 Get AI Recommendations"):
                     if st.button("➕ Add to Watchlist", key=f"a{i}"):
                         if movie['title'] not in st.session_state.watchlist:
                             st.session_state.watchlist.append(movie['title'])
-                            st.success("Added!")
+                            st.success(f"Added {movie['title']}!")
 
 # ---------- WATCHLIST ----------
 st.sidebar.title("📌 Watchlist")
 
 if not st.session_state.watchlist:
-    st.sidebar.caption("Empty")
+    st.sidebar.caption("Your watchlist is empty.")
 
 for i, title in enumerate(st.session_state.watchlist):
     c1, c2 = st.sidebar.columns([3, 1])
@@ -267,3 +256,7 @@ if st.session_state.selected_watch:
             trailer = get_trailer(movie['id'])
             if trailer:
                 st.video(trailer)
+
+
+
+
