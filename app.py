@@ -540,3 +540,8 @@ with tabs[2]:
                     st.session_state.selected_watch = None
                     st.rerun()
                 show_movie_detail(match.iloc[0])
+
+
+
+
+
