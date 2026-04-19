@@ -11,7 +11,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", " "63c39d2a4b6cbbe2c300411d8980ade1")
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "63c39d2a4b6cbbe2c300411d8980ade1")
 IMAGE_BASE   = "https://image.tmdb.org/t/p/w500"
 
 st.set_page_config(layout="wide", page_title="CineAI", page_icon="🎬")
